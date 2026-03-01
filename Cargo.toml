@@ -1,0 +1,36 @@
+[package]
+name = "anchormap"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Lock-free concurrent hash map: elements never move after insertion, enabling lock-free reads"
+repository = "https://github.com/mcrepeau/anchormap"
+authors = ["Matthieu Crepeau"]
+readme = "README.md"
+keywords = ["concurrent", "lock-free", "hashmap", "anchormap", "no-reorder"]
+categories = ["algorithms", "data-structures", "concurrency"]
+
+
+[features]
+serde = ["dep:serde"]
+
+[dependencies]
+ahash = "0.8"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+criterion = "0.8.2"
+dashmap = "6"
+papaya = "0.2"
+serde_json = "1"
+
+[[bench]]
+name = "anchormap_benchmarks"
+harness = false
+
+[profile.release]
+opt-level = 3          # Maximum optimizations
+codegen-units = 1      # Better optimizations (slower compile)
+lto = true             # Link-time optimizations
+panic = "abort"        # Smaller binaries
