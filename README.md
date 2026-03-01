@@ -4,33 +4,31 @@
 [![Documentation](https://docs.rs/anchormap/badge.svg)](https://docs.rs/anchormap)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A concurrent hash map where elements **never move after insertion**, enabling
+A concurrent hash map where elements are "anchored" and **never move after insertion**, enabling
 lock-free reads from any number of threads — no locking, no guards, no epoch pins.
 
-## When to use
+## How it works
 
-`anchormap` excels at concurrent workloads: it scales well with the number of
-threads and significantly outperforms every lock-based alternative. It is slower
-however than `papaya` and `Dashmap` but it is the right choice when the **reference lifetime** matters more than
-raw lookup throughput:
+The core idea is borrowed from [Farach-Colton, Krapivin, and Kuszmaul (2025)](https://arxiv.org/abs/2501.02305):
+a hash table where elements **never move after insertion** can still achieve competitive
+performance. Conventional open-addressing maps (Robin Hood, Swiss table) move elements
+during insertion and resize, making concurrent reads unsafe without locks.
 
-- **Async code** — holding a `DashMap::Ref` across an `.await` point risks a
-  deadlock; `&V` from `anchormap` is a plain reference with no such restriction
-- **Long-lived lookups** — hand `&V` to callers that hold it for the duration
-  of a request, connection, or session, without locking anything for that period
-- **Caches and registries** — look up a handler, codec, or config entry once
-  and keep the reference for its natural lifetime
-- **Zero-copy hot loops** — no guard construction or atomic epoch bump per call;
-  reads are pure atomic loads
+`anchormap` preserves stable addresses with a segmented allocator: the map grows by
+appending new segments (each double the previous size) — old segments are never modified
+or freed. Once a key is placed in a slot, its address is permanent, making raw `&V`
+references safe to hold across concurrent inserts without any guard or epoch pin.
 
-For comparison `DashMap` returns a `Ref` guard that holds a shard read lock; `papaya` requires
-an epoch guard from `map.pin()`. Both tie the reference lifetime to the guard.
-In `anchormap`, references are unconditional borrows backed by the guarantee that
-values never move.
+The probe technique within each segment follows [hashbrown](https://github.com/rust-lang/hashbrown)'s
+Swiss-table design: a **flat metadata array** (one byte per slot, 16 slots per cache line)
+stores a **7-bit fingerprint** `(hash >> 57) as u8` per occupied slot. A group probe loads
+one cache line of metadata, compares fingerprints in bulk, and only dereferences the
+data array on a match — roughly 1-in-128 false-positive rate. Groups are visited in a
+triangular sequence that covers every group in the segment exactly once.
 
-For workloads where you look up a value, use it immediately, and drop it,
-`DashMap` and `papaya` offer higher raw throughput. `anchormap` is not the fastest
-map but it offers a more ergonomic and flexible concurrent read API.
+Writes acquire one of 64 per-stripe locks (indexed by `hash % 64`), each on its own
+cache line to eliminate false sharing. Reads are fully lock-free, using Release/Acquire
+ordering on the metadata byte to synchronize with writers.
 
 ## Quick start
 
@@ -133,14 +131,18 @@ let map = HashMap::<String, u32, StandardHasher>::with_hasher(1024, StandardHash
 
 See [BENCHMARK.md](BENCHMARK.md) for a detailed comparison.
 
-## Memory characteristics
+## Important considerations
 
 **Pre-size the map accurately.** `HashMap::new(n)` allocates a single segment
 sized for `n` entries at ≤75 % load. Each time the map outgrows all existing
 segments a new one is added, double the size of the previous. Those old
 segments are never freed, so the total allocated slot capacity can be
-significantly larger than the live entry count after several growth events. If
-you know your expected peak size, pass it to `new()` to stay in one segment and
+significantly larger than the live entry count after several growth events.
+
+In addition to that, inserts iterates all `n` segments, both to check for dupes
+and to find the first available slot and scans up to 64 slots per segment, while gets will
+iterate segments but end as soon as a match is found.  To guarantee the best performance,
+if you know your expected peak size, pass it to `new()` to stay in one segment and
 keep utilisation near 75 %.
 
 **Fixed per-instance overhead.** Every `HashMap`, regardless of its capacity,
@@ -158,30 +160,35 @@ reference. Dropping the value eagerly would dangle those references.
 
 As a consequence, the map's allocated slot capacity only grows, never shrinks.
 This is the expected behaviour for caches and registries that grow to a steady
-state. It may be surprising for workloads that insert a large number of entries
+state but it may be surprising for workloads that insert a large number of entries
 and then delete most of them without re-inserting — in that case the heap
 memory owned by the removed `K`/`V` values (e.g. `String`, `Vec`) is freed
 promptly, but the fixed-size slot array is not reclaimed until reuse or drop.
 
-## How it works
+## When to use
 
-The core idea is borrowed from [Farach-Colton, Krapivin, and Kuszmaul (2025)](https://arxiv.org/abs/2501.02305):
-a hash table where elements **never move after insertion** can still achieve competitive
-performance. Conventional open-addressing maps (Robin Hood, Swiss table) move elements
-during insertion and resize, making concurrent reads unsafe without locks.
+`anchormap` excels at concurrent workloads: it scales well with the number of
+threads and significantly outperforms every lock-based alternative. It is slower than `papaya` for reads
+and consistently underperforms `Dashmap` but it is a good choice when the **reference lifetime** matters more than
+raw lookup throughput:
 
-`anchormap` preserves stable addresses with a segmented allocator: the map grows by
-appending new segments (each double the previous size) — old segments are never modified
-or freed. Once a key is placed in a slot, its address is permanent, making raw `&V`
-references safe to hold across concurrent inserts without any guard or epoch pin.
+- **Async code** — holding a `DashMap::Ref` across an `.await` point risks a
+  deadlock; `&V` from `anchormap` is a plain reference with no such restriction
+- **Long-lived lookups** — hand `&V` to callers that hold it for the duration
+  of a request, connection, or session, without locking anything for that period
+- **Caches and registries** — look up a handler, codec, or config entry once
+  and keep the reference for its natural lifetime
+- **Zero-copy hot loops** — no guard construction or atomic epoch bump per call;
+  reads are pure atomic loads
 
-The probe technique within each segment follows [hashbrown](https://github.com/rust-lang/hashbrown)'s
-Swiss-table design: a **flat metadata array** (one byte per slot, 16 slots per cache line)
-stores a **7-bit fingerprint** `(hash >> 57) as u8` per occupied slot. A group probe loads
-one cache line of metadata, compares fingerprints in bulk, and only dereferences the
-data array on a match — roughly 1-in-128 false-positive rate. Groups are visited in a
-triangular sequence that covers every group in the segment exactly once.
+For comparison `DashMap` returns a `Ref` guard that holds a shard read lock; `papaya` requires
+an epoch guard from `map.pin()`. Both tie the reference lifetime to the guard.
+In `anchormap`, references are unconditional borrows backed by the guarantee that
+values never move.
 
-Writes acquire one of 64 per-stripe locks (indexed by `hash % 64`), each on its own
-cache line to eliminate false sharing. Reads are fully lock-free, using Release/Acquire
-ordering on the metadata byte to synchronize with writers.
+For workloads where you look up a value, use it immediately, and drop it,
+`DashMap` and `papaya` offer higher raw throughput. For maps that will grow
+far beyond their initial size, `anchormap` is not a good choice due to its 
+memory model and segment allocator. But for maps of a predictable size
+involving a workload light on deletes, `anchormap` offers consistent performance
+and a more ergonomic and flexible concurrent read API.
