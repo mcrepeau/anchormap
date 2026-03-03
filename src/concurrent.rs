@@ -44,7 +44,7 @@ use std::cell::UnsafeCell;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
@@ -108,6 +108,59 @@ struct WriteLane {
 
 type DataCell<K, V> = UnsafeCell<MaybeUninit<(K, V)>>;
 
+// ── Bloom filter ──────────────────────────────────────────────────────────────
+
+/// A 512-bit Bloom filter (8 × `AtomicU64`) with k=2 hash functions.
+///
+/// Used as a per-segment membership filter: `maybe_contains` returns `false`
+/// only when the key is *definitely* absent (false negatives are impossible).
+/// False positives (~0.2–2.7 % for small segments) cause an unnecessary probe.
+///
+/// Bit positions are derived from non-overlapping ranges of the hash, separate
+/// from the 7-bit metadata fingerprint (bits 57–63):
+///   p1 = hash as usize & 511         (bits 0–8)
+///   p2 = (hash >> 20) as usize & 511 (bits 20–28)
+///
+/// The filter is monotonically append-only: bits are only ever set, never
+/// cleared. Ordering: `set` uses `fetch_or(Release)`; `maybe_contains` uses
+/// `load(Acquire)`.
+struct BloomFilter {
+    bits: [AtomicU64; 8],
+    /// When `false` (segment 0): `set` is a no-op and `maybe_contains` always
+    /// returns `true`. Segment 0 is always probed via the `probe_seg0` fast
+    /// path, so its bloom bits are never consulted — maintaining them would
+    /// add two atomic RMW operations per insert with zero benefit.
+    active: bool,
+}
+
+impl BloomFilter {
+    fn new(active: bool) -> Self {
+        Self { bits: std::array::from_fn(|_| AtomicU64::new(0)), active }
+    }
+
+    /// Set the two bit positions for `hash`. No-op when inactive (segment 0).
+    #[inline]
+    fn set(&self, hash: u64) {
+        if !self.active { return; }
+        let p1 = hash as usize & 511;
+        let p2 = (hash >> 20) as usize & 511;
+        self.bits[p1 / 64].fetch_or(1u64 << (p1 % 64), Ordering::Release);
+        self.bits[p2 / 64].fetch_or(1u64 << (p2 % 64), Ordering::Release);
+    }
+
+    /// Returns `true` if the key *might* be present; `false` means definitely absent.
+    /// Always returns `true` when inactive (segment 0), so it is never skipped.
+    #[inline]
+    fn maybe_contains(&self, hash: u64) -> bool {
+        if !self.active { return true; }
+        let p1 = hash as usize & 511;
+        let p2 = (hash >> 20) as usize & 511;
+        let w1 = self.bits[p1 / 64].load(Ordering::Acquire);
+        let w2 = self.bits[p2 / 64].load(Ordering::Acquire);
+        (w1 >> (p1 % 64)) & 1 == 1 && (w2 >> (p2 % 64)) & 1 == 1
+    }
+}
+
 // ── Segment ───────────────────────────────────────────────────────────────────
 
 /// An independent flat allocation with a separate metadata and data array.
@@ -124,6 +177,8 @@ struct Segment<K, V> {
     num_groups: usize,
     /// `num_groups - 1`.  Used for masking group indices.
     group_mask: usize,
+    /// Per-segment Bloom filter for fast skip on miss path.
+    bloom: BloomFilter,
 }
 
 // SAFETY: all mutable access is synchronized via atomics, stripe locks, or
@@ -135,7 +190,7 @@ impl<K, V> Segment<K, V> {
     /// Allocate a new segment with `size` slots (all `META_EMPTY`).
     ///
     /// `size` must be a multiple of `GROUP_SIZE` and a power of two.
-    fn new(size: usize) -> Self {
+    fn new(size: usize, active_bloom: bool) -> Self {
         debug_assert!(size >= GROUP_SIZE, "size must be ≥ GROUP_SIZE");
         debug_assert!(size.is_multiple_of(GROUP_SIZE), "size must be a multiple of GROUP_SIZE");
         debug_assert!(size.is_power_of_two(), "size must be a power of two");
@@ -150,7 +205,7 @@ impl<K, V> Segment<K, V> {
             .into_boxed_slice();
         let num_groups = size / GROUP_SIZE;
         let group_mask = num_groups - 1;
-        Self { meta, data, size, num_groups, group_mask }
+        Self { meta, data, size, num_groups, group_mask, bloom: BloomFilter::new(active_bloom) }
     }
 
     /// Lock-free probe: returns `(slot_idx, &K, &V)` if `key` is present.
@@ -399,6 +454,9 @@ impl<K, V> Segment<K, V> {
     /// tombstone the caller must have dropped the old data before calling this.
     unsafe fn write_slot(&self, slot: usize, hash: u64, key: K, value: V) {
         (*self.data[slot].get()).write((key, value));
+        // Release: ensures the bloom bit is visible to any reader who later
+        // observes the metadata fingerprint via Acquire.
+        self.bloom.set(hash);
         // Release: pairs with readers' Acquire load of the metadata byte.
         self.meta[slot].store((hash >> 57) as u8, Ordering::Release);
     }
@@ -695,6 +753,7 @@ where
             unsafe {
                 let seg = &*seg_ptr;
                 (*seg.data[slot_idx].get()).write((self.key, value));
+                seg.bloom.set(self.hash);
                 seg.meta[slot_idx]
                     .store((self.hash >> 57) as u8, Ordering::Release);
             }
@@ -886,7 +945,7 @@ where
         let segments: Box<[AtomicPtr<Segment<K, V>>; MAX_SEGMENTS]> =
             Box::new(std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())));
 
-        let first = Box::into_raw(Box::new(Segment::new(initial_size)));
+        let first = Box::into_raw(Box::new(Segment::new(initial_size, false)));
         // Release: segment fully initialized before any reader sees it.
         segments[0].store(first, Ordering::Release);
 
@@ -989,8 +1048,10 @@ where
             // SAFETY: indices 1..n are non-null; segments live for 'map.
             let seg: &'map Segment<K, V> =
                 unsafe { &*self.segments[i].load(Ordering::Relaxed) };
-            if let Some(v) = seg.get(hash, key) {
-                return Some(v);
+            if seg.bloom.maybe_contains(hash) {
+                if let Some(v) = seg.get(hash, key) {
+                    return Some(v);
+                }
             }
         }
         None
@@ -1021,15 +1082,26 @@ where
         for i in 0..n {
             let ptr = self.segments[i].load(Ordering::Relaxed);
             let seg = unsafe { &*ptr };
-            let (available, dup) = seg.probe_for_insert(hash, &key);
-            if dup.is_some() {
-                return false; // key already present
-            }
-            if claim.is_none() {
-                if let Some((slot, old_state)) = available {
+            if seg.bloom.maybe_contains(hash) {
+                // Key might be here: full dup check + available slot probe.
+                let (available, dup) = seg.probe_for_insert(hash, &key);
+                if dup.is_some() {
+                    return false; // key already present
+                }
+                if claim.is_none() {
+                    if let Some((slot, old_state)) = available {
+                        claim = Some((ptr as *const _, slot, old_state));
+                    }
+                }
+            } else if claim.is_none() {
+                // Key is definitely absent from this segment; skip dup check.
+                // Only look for an available slot to use as write target.
+                if let Some(slot) = seg.find_available(hash) {
+                    let old_state = seg.meta[slot].load(Ordering::Relaxed);
                     claim = Some((ptr as *const _, slot, old_state));
                 }
             }
+            // If bloom negative and claim already set: skip segment entirely.
         }
 
         // No duplicate. Claim the identified slot via CAS.
@@ -1101,15 +1173,25 @@ where
         for i in 0..n {
             let ptr = self.segments[i].load(Ordering::Relaxed);
             let seg: &'map Segment<K, V> = unsafe { &*ptr };
-            let (available, dup) = seg.probe_for_insert(hash, &key);
-            if let Some(v) = dup {
-                return v;
-            }
-            if claim.is_none() {
-                if let Some((slot, old_state)) = available {
+            if seg.bloom.maybe_contains(hash) {
+                // Key might be here: full dup check + available slot probe.
+                let (available, dup) = seg.probe_for_insert(hash, &key);
+                if let Some(v) = dup {
+                    return v;
+                }
+                if claim.is_none() {
+                    if let Some((slot, old_state)) = available {
+                        claim = Some((ptr as *const _, slot, old_state));
+                    }
+                }
+            } else if claim.is_none() {
+                // Key is definitely absent; skip dup check, only seek a slot.
+                if let Some(slot) = seg.find_available(hash) {
+                    let old_state = seg.meta[slot].load(Ordering::Relaxed);
                     claim = Some((ptr as *const _, slot, old_state));
                 }
             }
+            // If bloom negative and claim already set: skip segment entirely.
         }
 
         if let Some((seg_ptr, slot_idx, old_state)) = claim {
@@ -1192,7 +1274,7 @@ where
         assert!(n_segs < MAX_SEGMENTS, "anchormap: all segments exhausted (unreachable at normal scales)");
         let prev_size = unsafe { (*self.segments[n_segs - 1].load(Ordering::Relaxed)).size };
         let next_size = prev_size.saturating_mul(2).next_power_of_two();
-        let new_seg_ptr = Box::into_raw(Box::new(Segment::new(next_size)));
+        let new_seg_ptr = Box::into_raw(Box::new(Segment::new(next_size, true)));
         // Release: segment fully initialized before readers can see this ptr.
         self.segments[n_segs].store(new_seg_ptr, Ordering::Release);
         // Release: readers Acquire n_segments; must be after the segment store.
@@ -1278,8 +1360,10 @@ where
         for i in 1..n {
             let seg: &'map Segment<K, V> =
                 unsafe { &*self.segments[i].load(Ordering::Relaxed) };
-            if let Some(pair) = seg.get_pair(hash, key) {
-                return Some(pair);
+            if seg.bloom.maybe_contains(hash) {
+                if let Some(pair) = seg.get_pair(hash, key) {
+                    return Some(pair);
+                }
             }
         }
         None
@@ -1323,6 +1407,7 @@ where
         for i in 0..n {
             let ptr = self.segments[i].load(Ordering::Relaxed) as *const Segment<K, V>;
             let seg = unsafe { &*ptr };
+            if !seg.bloom.maybe_contains(hash) { continue; }
             if let Some(slot_idx) = seg.get_slot_idx(hash, key) {
                 hint = Some((ptr, slot_idx));
                 break;
@@ -1361,6 +1446,7 @@ where
                 break;
             }
             let seg: &Segment<K, V> = unsafe { &*ptr };
+            if !seg.bloom.maybe_contains(hash) { continue; }
             if let Ok(slot_idx) = seg.probe_entry(hash, key) {
                 seg.meta[slot_idx].store(META_TOMBSTONE, Ordering::Release);
                 self.write_stripes[stripe_idx].count.fetch_sub(1, Ordering::Relaxed);
@@ -1398,6 +1484,7 @@ where
                 break;
             }
             let seg: &Segment<K, V> = unsafe { &*ptr };
+            if !seg.bloom.maybe_contains(hash) { continue; }
             if let Ok(slot_idx) = seg.probe_entry(hash, key) {
                 let v = unsafe {
                     &mut (*seg.data[slot_idx].get()).assume_init_mut().1
@@ -1430,6 +1517,7 @@ where
                 break;
             }
             let seg: &Segment<K, V> = unsafe { &*ptr };
+            if !seg.bloom.maybe_contains(hash) { continue; }
             if let Ok(slot_idx) = seg.probe_entry(hash, key) {
                 let kv = unsafe { (*seg.data[slot_idx].get()).assume_init_read() };
                 seg.meta[slot_idx].store(META_EMPTY, Ordering::Relaxed);
@@ -1519,6 +1607,8 @@ where
             }
             let seg: &Segment<K, V> = unsafe { &*ptr };
 
+            if !seg.bloom.maybe_contains(hash) { continue; }
+
             match seg.probe_entry(hash, &key) {
                 Ok(slot_idx) => {
                     return Entry::Occupied(OccupiedEntry {
@@ -1593,7 +1683,7 @@ where
             unsafe { (*prev).size }
         };
         let new_size = last_size.saturating_mul(2).next_power_of_two();
-        let new_seg = Box::new(Segment::new(new_size));
+        let new_seg = Box::new(Segment::new(new_size, true));
 
         let slot_idx = new_seg
             .find_available(hash)
