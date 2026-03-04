@@ -57,7 +57,9 @@ trait ConcurrentMap: Send + Sync + 'static {
 
 // ── anchormap ───────────────────────────────────────────────────────────────────
 
-struct AnchorMap(HashMap<u64, u64>);
+// AnchorMap stores AtomicU64 values for correct concurrent in-place mutation:
+// get() returns &AtomicU64, then fetch_add is lock-free and data-race-free.
+struct AnchorMap(HashMap<u64, AtomicU64>);
 
 impl ConcurrentMap for AnchorMap {
     #[inline]
@@ -66,7 +68,7 @@ impl ConcurrentMap for AnchorMap {
     }
     #[inline]
     fn insert_new(&self, key: u64) {
-        let _ = self.0.insert(key, key);
+        let _ = self.0.insert(key, AtomicU64::new(key));
     }
     #[inline]
     fn remove_key(&self, key: u64) {
@@ -74,7 +76,9 @@ impl ConcurrentMap for AnchorMap {
     }
     #[inline]
     fn modify_key(&self, key: u64) {
-        self.0.modify(&key, |v| *v = v.wrapping_add(1));
+        if let Some(v) = self.0.get(&key) {
+            v.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -268,7 +272,7 @@ fn run<M: ConcurrentMap>(map: Arc<M>, n_threads: usize, wl: &Workload) -> RunRes
 fn preload_anchormap() -> AnchorMap {
     let map = HashMap::new(CAPACITY);
     for i in 0..INITIAL_KEYS {
-        map.insert(i, i);
+        map.insert(i, AtomicU64::new(i));
     }
     AnchorMap(map)
 }

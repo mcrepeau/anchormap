@@ -31,9 +31,22 @@
 //! `META_TOMBSTONE` is used by [`HashMap::remove`] for logical deletion without
 //! invalidating outstanding `&V` references from [`HashMap::get`].
 //!
+//! # Stability invariant
+//!
+//! Under shared (`&self`) access, an inserted value **never moves**: a value
+//! written to slot `i` of a segment remains there for the segment's lifetime.
+//! This is what allows `get()` to return `&'map V` references that are valid
+//! for the entire shared-borrow lifetime without holding any guard.
+//!
+//! The invariant is scoped to `&self` access. Exclusive (`&mut self`)
+//! operations such as [`HashMap::shrink_to_fit`] may reallocate and move
+//! entries; this is sound because `&mut self` statically excludes all live
+//! `&V` references — they are bound to a `&self` borrow, which cannot coexist
+//! with `&mut self`.
+//!
 //! # Locking
 //!
-//! Writes (`insert`, `remove`, `modify`) are serialized per stripe: there are
+//! Writes (`insert`, `remove`) are serialized per stripe: there are
 //! [`NUM_STRIPES`] independent write locks, indexed by `hash % NUM_STRIPES`.
 //! Concurrent writers on different keys that fall in different stripes run in
 //! parallel; slot conflicts are resolved by CAS. A separate `growth_lock`
@@ -466,6 +479,53 @@ impl<'a, K, V, H> Iterator for Iter<'a, K, V, H> {
     }
 }
 
+/// Exclusive mutable iterator over `(&K, &mut V)` pairs.
+///
+/// Obtained via [`HashMap::iter_mut`]. Requires exclusive access (`&mut self`).
+pub struct IterMut<'a, K, V, H = AHashHasher> {
+    map: &'a mut HashMap<K, V, H>,
+    seg_idx: usize,
+    slot_idx: usize,
+}
+
+impl<'a, K, V, H> Iterator for IterMut<'a, K, V, H> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.seg_idx >= MAX_SEGMENTS {
+                return None;
+            }
+            // Relaxed: exclusive &mut self; no concurrent segment allocation.
+            let ptr = self.map.segments[self.seg_idx].load(Ordering::Relaxed);
+            if ptr.is_null() {
+                return None;
+            }
+            let seg = unsafe { &*ptr };
+
+            if self.slot_idx >= seg.size {
+                self.seg_idx += 1;
+                self.slot_idx = 0;
+                continue;
+            }
+
+            let idx = self.slot_idx;
+            self.slot_idx += 1;
+
+            // Occupied: high bit clear (fingerprint in 0x00..=0x7F).
+            if seg.meta[idx].load(Ordering::Relaxed) & 0x80 == 0 {
+                // SAFETY: OCCUPIED + exclusive &mut borrow guarantees no aliasing.
+                // Raw pointer dereference extends lifetime to 'a; sound because the
+                // segment lives for 'a and slot_idx advances (no slot yielded twice).
+                unsafe {
+                    let pair_ptr = (*seg.data[idx].get()).as_mut_ptr();
+                    return Some((&(*pair_ptr).0, &mut (*pair_ptr).1));
+                }
+            }
+        }
+    }
+}
+
 /// Consuming iterator over `(K, V)` pairs.
 pub struct IntoIter<K, V, H = AHashHasher> {
     map: HashMap<K, V, H>,
@@ -779,8 +839,8 @@ where
 ///
 /// The API mirrors [`std::collections::HashMap`] as closely as possible:
 /// - **`&self`** (concurrent-safe): `get`, `contains_key`, `iter`, `len`, …
-/// - **`&mut self`** (exclusive access): `entry`, `drain`, `clear`, …
-/// - **`&self` with internal lock**: `insert`, `remove`, `modify`
+/// - **`&self` with internal lock**: `insert`, `remove`, `reserve`, `get_or_insert`, …
+/// - **`&mut self`** (exclusive access): `entry`, `drain`, `clear`, `modify`, `get_mut`, …
 ///
 /// # Examples
 ///
@@ -1370,43 +1430,91 @@ where
         false
     }
 
-    /// Applies `f` to the value associated with `key` under the internal write
-    /// lock. Returns `true` if the key was found, `false` otherwise.
+    /// Reserves capacity for at least `additional` more elements without growing
+    /// during subsequent inserts.
     ///
-    /// Accepts any borrowed form of the key: `map.modify("str", f)` works for
-    /// `HashMap<String, V>` because `String: Borrow<str>`.
+    /// After this call, `capacity() >= len() + additional`. One or more new
+    /// segments may be allocated (each double the size of the previous one).
     ///
-    /// # Concurrency note
+    /// Available on `&self`; can be called concurrently with reads and writes.
+    pub fn reserve(&self, additional: usize) {
+        let needed = self.len().saturating_add(additional);
+        if self.total_capacity.load(Ordering::Relaxed) >= needed {
+            return;
+        }
+        let _growth = self.growth_lock.lock();
+        while self.total_capacity.load(Ordering::Relaxed) < needed {
+            let n_segs = self.n_segments.load(Ordering::Relaxed);
+            assert!(n_segs < MAX_SEGMENTS, "anchormap: all segments exhausted");
+            let prev_size =
+                unsafe { (*self.segments[n_segs - 1].load(Ordering::Relaxed)).size };
+            let next_size = prev_size.saturating_mul(2).next_power_of_two();
+            let new_seg_ptr = Box::into_raw(Box::new(Segment::new(next_size)));
+            self.segments[n_segs].store(new_seg_ptr, Ordering::Release);
+            self.n_segments.fetch_add(1, Ordering::Release);
+            self.total_capacity.fetch_add(next_size, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns a reference to the value for `key`. If absent, calls `f` to
+    /// produce a value; if `f` returns `Err`, that error is propagated and
+    /// the map is left unchanged.
     ///
-    /// `modify` holds the write lock while `f` runs, serializing it with all
-    /// other `insert`, `remove`, and `modify` calls. However, concurrent
-    /// lock-free `get()` calls may read the value while `f` mutates it. For
-    /// non-atomic `V` this is a data race — only use `modify` when `V` provides
-    /// its own synchronization or when no concurrent reads overlap.
+    /// Available on `&self`; safe to call concurrently from multiple threads.
+    ///
+    /// # Warning: closure runs under a write lock
+    ///
+    /// See [`get_or_insert_with`](Self::get_or_insert_with) for the same
+    /// caveat about keeping the closure short and non-blocking.
     #[inline]
-    pub fn modify<Q, F>(&self, key: &Q, f: F) -> bool
+    pub fn get_or_try_insert_with<'map, E, F>(
+        &'map self,
+        key: K,
+        f: F,
+    ) -> Result<&'map V, E>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-        F: FnOnce(&mut V),
+        F: FnOnce() -> Result<V, E>,
     {
-        let hash = self.hasher.hash_key(key);
-        let _guard = self.write_stripes[hash as usize % NUM_STRIPES].lock.lock();
-        for i in 0..MAX_SEGMENTS {
+        let hash = self.hasher.hash_key(&key);
+        let stripe_idx = hash as usize % NUM_STRIPES;
+        let _stripe = self.write_stripes[stripe_idx].lock.lock();
+
+        let n = self.n_segments.load(Ordering::Acquire);
+        let mut claim: Option<(*const Segment<K, V>, usize, u8)> = None;
+
+        for i in 0..n {
             let ptr = self.segments[i].load(Ordering::Relaxed);
-            if ptr.is_null() {
-                break;
+            let seg: &'map Segment<K, V> = unsafe { &*ptr };
+            let (available, dup) = seg.probe_for_insert(hash, &key);
+            if let Some(v) = dup {
+                return Ok(v);
             }
-            let seg: &Segment<K, V> = unsafe { &*ptr };
-            if let Ok(slot_idx) = seg.probe_entry(hash, key) {
-                let v = unsafe {
-                    &mut (*seg.data[slot_idx].get()).assume_init_mut().1
-                };
-                f(v);
-                return true;
+            if claim.is_none() {
+                if let Some((slot, old_state)) = available {
+                    claim = Some((ptr as *const _, slot, old_state));
+                }
             }
         }
-        false
+
+        // Key is absent; call the closure. On Err, the map is left unchanged.
+        let value = f()?;
+
+        if let Some((seg_ptr, slot_idx, old_state)) = claim {
+            let seg = unsafe { &*seg_ptr };
+            if seg.meta[slot_idx]
+                .compare_exchange(old_state, META_RESERVED, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                if old_state == META_TOMBSTONE {
+                    unsafe { (*seg.data[slot_idx].get()).assume_init_drop() };
+                }
+                unsafe { seg.write_slot(slot_idx, hash, key, value) };
+                self.write_stripes[stripe_idx].count.fetch_add(1, Ordering::Relaxed);
+                return Ok(unsafe { &(*seg.data[slot_idx].get()).assume_init_ref().1 });
+            }
+        }
+
+        Ok(unsafe { &*self.insert_absent(hash, key, value) })
     }
 
     // ── Exclusive (&mut self) ─────────────────────────────────────────────────
@@ -1439,6 +1547,110 @@ where
             }
         }
         None
+    }
+
+    /// Applies `f` to the value associated with `key` in place.
+    ///
+    /// Returns `true` if the key was found, `false` otherwise.
+    ///
+    /// Accepts any borrowed form of the key: `map.modify("str", f)` works for
+    /// `HashMap<String, V>` because `String: Borrow<str>`.
+    ///
+    /// Requires exclusive access (`&mut self`), which prevents concurrent reads
+    /// and writes, making mutation of any `V` sound.
+    pub fn modify<Q, F>(&mut self, key: &Q, f: F) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+        F: FnOnce(&mut V),
+    {
+        let hash = self.hasher.hash_key(key);
+        for i in 0..MAX_SEGMENTS {
+            let ptr = self.segments[i].load(Ordering::Relaxed);
+            if ptr.is_null() { break; }
+            let seg: &Segment<K, V> = unsafe { &*ptr };
+            if let Ok(slot_idx) = seg.probe_entry(hash, key) {
+                let v = unsafe { &mut (*seg.data[slot_idx].get()).assume_init_mut().1 };
+                f(v);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns a mutable reference to the value for `key`, or `None` if absent.
+    ///
+    /// Accepts any borrowed form of the key: `map.get_mut("str")` works for
+    /// `HashMap<String, V>` because `String: Borrow<str>`.
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hasher.hash_key(key);
+        for i in 0..MAX_SEGMENTS {
+            let ptr = self.segments[i].load(Ordering::Relaxed);
+            if ptr.is_null() { break; }
+            let seg: &Segment<K, V> = unsafe { &*ptr };
+            if let Ok(slot_idx) = seg.probe_entry(hash, key) {
+                return Some(unsafe { &mut (*seg.data[slot_idx].get()).assume_init_mut().1 });
+            }
+        }
+        None
+    }
+
+    /// Returns a mutable iterator over all `(&K, &mut V)` pairs.
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V, H> {
+        IterMut { map: self, seg_idx: 0, slot_idx: 0 }
+    }
+
+    /// Returns a mutable iterator over all values.
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.iter_mut().map(|(_, v)| v)
+    }
+
+    /// Shrinks the map's allocated capacity to the minimum needed for the
+    /// current elements, freeing all excess segments.
+    ///
+    /// All entries are **moved** into a single fresh segment — this is the one
+    /// operation that relocates values. It is sound because `&mut self`
+    /// statically prevents any `&V` reference (bound to a `&self` borrow) from
+    /// being held across this call. After it returns, `capacity()` is the
+    /// smallest power-of-two that can hold the current elements at ≤ 75 % load.
+    pub fn shrink_to_fit(&mut self) {
+        let entries: Vec<(K, V)> = self.drain().collect();
+
+        // Drop all existing segments (drain left their slots META_EMPTY;
+        // Segment::drop handles any residual tombstone data).
+        for i in 0..MAX_SEGMENTS {
+            let ptr = self.segments[i].load(Ordering::Relaxed);
+            if ptr.is_null() { break; }
+            // SAFETY: ptr from Box::into_raw; exclusive &mut self.
+            unsafe { drop(Box::from_raw(ptr)) };
+            self.segments[i].store(std::ptr::null_mut(), Ordering::Relaxed);
+        }
+        self.n_segments.store(0, Ordering::Relaxed);
+        self.total_capacity.store(0, Ordering::Relaxed);
+
+        // Allocate a fresh right-sized segment.
+        let n = entries.len();
+        let initial_size = (n.saturating_mul(4) / 3 + 1)
+            .max(GROUP_SIZE)
+            .next_power_of_two();
+        let first = Box::into_raw(Box::new(Segment::new(initial_size)));
+        self.segments[0].store(first, Ordering::Release);
+        self.n_segments.store(1, Ordering::Release);
+        self.total_capacity.store(initial_size, Ordering::Relaxed);
+
+        // Update the segment-0 inline pointer cache.
+        self.seg0_meta = unsafe { (*first).meta.as_ptr() };
+        self.seg0_data = unsafe { (*first).data.as_ptr() };
+        self.seg0_mask = unsafe { (*first).group_mask };
+
+        // Re-insert all entries. &mut self excludes concurrent access.
+        for (k, v) in entries {
+            self.insert(k, v);
+        }
     }
 
     /// Clears the map, removing all key-value pairs. Does not free memory.
@@ -1754,6 +1966,19 @@ impl<K, V, H> IntoIterator for HashMap<K, V, H> {
     }
 }
 
+impl<'a, K, V, H> IntoIterator for &'a mut HashMap<K, V, H>
+where
+    K: Eq + Hash,
+    H: TableHasher,
+{
+    type Item = (&'a K, &'a mut V);
+    type IntoIter = IterMut<'a, K, V, H>;
+
+    fn into_iter(self) -> IterMut<'a, K, V, H> {
+        self.iter_mut()
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1942,7 +2167,7 @@ mod tests {
 
     #[test]
     fn test_modify() {
-        let map = HashMap::<u32, u32>::new(64);
+        let mut map = HashMap::<u32, u32>::new(64);
         map.insert(1, 10);
         assert!(map.modify(&1, |v| *v = 99));
         assert_eq!(map.get(&1), Some(&99));
@@ -2408,7 +2633,7 @@ mod tests {
 
     #[test]
     fn test_borrow_modify_string_key() {
-        let map = HashMap::<String, u32>::new(64);
+        let mut map = HashMap::<String, u32>::new(64);
         map.insert("x".to_string(), 10);
         assert!(map.modify("x", |v| *v += 5));
         assert_eq!(map.get("x"), Some(&15));
@@ -2481,5 +2706,87 @@ mod tests {
         });
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&42), Some(&1));
+    }
+
+    // ── Phase 1 new API tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_mut() {
+        let mut map = HashMap::<u32, u32>::new(16);
+        map.insert(1, 10);
+        map.insert(2, 20);
+        *map.get_mut(&1).unwrap() = 99;
+        assert_eq!(map.get(&1), Some(&99));
+        assert_eq!(map.get(&2), Some(&20));
+        assert!(map.get_mut(&99).is_none());
+    }
+
+    #[test]
+    fn test_iter_mut() {
+        let mut map = HashMap::<u32, u32>::new(16);
+        for i in 0..10u32 { map.insert(i, i * 2); }
+        for (_, v) in map.iter_mut() { *v += 1; }
+        for i in 0..10u32 {
+            assert_eq!(map.get(&i), Some(&(i * 2 + 1)));
+        }
+    }
+
+    #[test]
+    fn test_values_mut() {
+        let mut map = HashMap::<u32, u32>::new(16);
+        map.insert(1, 10);
+        map.insert(2, 20);
+        for v in map.values_mut() { *v *= 3; }
+        let mut vals: Vec<u32> = map.values().copied().collect();
+        vals.sort_unstable();
+        assert_eq!(vals, vec![30, 60]);
+    }
+
+    #[test]
+    fn test_reserve() {
+        let map = HashMap::<u32, u32>::new(16);
+        let cap_before = map.capacity();
+        map.reserve(10_000);
+        assert!(map.capacity() >= cap_before + 10_000);
+    }
+
+    #[test]
+    fn test_get_or_try_insert_with_present() {
+        let map = HashMap::<u32, u32>::new(16);
+        map.insert(1, 42);
+        let r: Result<&u32, ()> = map.get_or_try_insert_with(1, || Ok(99));
+        assert_eq!(r, Ok(&42)); // existing value returned, closure not called
+    }
+
+    #[test]
+    fn test_get_or_try_insert_with_absent_ok() {
+        let map = HashMap::<u32, u32>::new(16);
+        let r: Result<&u32, &str> = map.get_or_try_insert_with(1, || Ok(42));
+        assert_eq!(r, Ok(&42));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_get_or_try_insert_with_absent_err() {
+        let map = HashMap::<u32, u32>::new(16);
+        let r: Result<&u32, &str> = map.get_or_try_insert_with(1, || Err("oops"));
+        assert_eq!(r, Err("oops"));
+        assert_eq!(map.len(), 0); // map left unchanged on Err
+    }
+
+    #[test]
+    fn test_shrink_to_fit() {
+        let mut map = HashMap::<u32, u32>::new(1);
+        // Insert enough to force multiple segments.
+        for i in 0..500u32 { map.insert(i, i); }
+        let segs_before = map.n_segments.load(Ordering::Relaxed);
+        assert!(segs_before > 1, "expected multiple segments after growth");
+        map.shrink_to_fit();
+        // After shrink: single segment, all entries preserved.
+        assert_eq!(map.n_segments.load(Ordering::Relaxed), 1);
+        assert_eq!(map.len(), 500);
+        for i in 0..500u32 {
+            assert_eq!(map.get(&i), Some(&i), "missing key {i} after shrink");
+        }
     }
 }
