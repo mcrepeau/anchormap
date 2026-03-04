@@ -11,7 +11,7 @@ four concurrent map implementations: **Contrie**, **DashMap**, **Flurry**, and *
 *Hardware:*
 - CPU: Intel Core Ultra 7 265K
 - Memory: 32GB DDR5-6400 32-40-40-84 (Corsair CMK32GX5M2B6400Z32)
-- OS: Windows 10 Pro 64-bit
+- OS: Windows 11 Pro 64-bit
 
 ## Read Heavy
 
