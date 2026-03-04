@@ -252,22 +252,23 @@ fn map_remove_reinsert(c: &mut Criterion) {
     g.finish();
 }
 
-/// `modify` — mutate the value of an existing key under the stripe lock.
+/// `modify` — mutate the value of an existing key in place (requires `&mut self`).
 fn map_modify(c: &mut Criterion) {
     let n = 10_000usize;
-    let m = filled_map(n);
     let mut g = c.benchmark_group("anchormap/modify");
     g.throughput(Throughput::Elements(n as u64));
-    // Hit: key present — takes the lock, finds the slot, applies closure.
+    // Hit: key present — finds the slot, applies closure.
     g.bench_function("hit_10k", |b| {
+        let mut m = filled_map(n);
         b.iter(|| {
             for i in 0..n as u64 {
                 m.modify(black_box(&i), |v| *v = v.wrapping_add(1));
             }
         });
     });
-    // Miss: key absent — takes the lock, exhausts the probe, returns false.
+    // Miss: key absent — exhausts the probe, returns false.
     g.bench_function("miss_10k", |b| {
+        let mut m = filled_map(n);
         b.iter(|| {
             let mut found = 0usize;
             for i in n as u64..(2 * n) as u64 {

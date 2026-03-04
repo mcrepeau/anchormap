@@ -27,5 +27,5 @@ mod serde;
 
 pub use concurrent::HashMap;
 pub use concurrent::{Entry, OccupiedEntry, VacantEntry};
-pub use concurrent::Drain;
+pub use concurrent::{Drain, IterMut};
 pub use hashing::{TableHasher, AHashHasher, StandardHasher};
