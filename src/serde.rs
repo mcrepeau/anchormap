@@ -4,7 +4,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! anchormap = { version = "0.1", features = ["serde"] }
+//! anchormap = { version = "0.2", features = ["serde"] }
 //! ```
 
 use std::hash::Hash;

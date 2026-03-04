@@ -35,7 +35,7 @@ ordering on the metadata byte to synchronize with writers.
 
 ```toml
 [dependencies]
-anchormap = "0.1"
+anchormap = "0.2"
 
 # Enable serde Serialize / Deserialize:
 # anchormap = { version = "0.1", features = ["serde"] }
