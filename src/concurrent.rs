@@ -31,9 +31,22 @@
 //! `META_TOMBSTONE` is used by [`HashMap::remove`] for logical deletion without
 //! invalidating outstanding `&V` references from [`HashMap::get`].
 //!
+//! # Stability invariant
+//!
+//! Under shared (`&self`) access, an inserted value **never moves**: a value
+//! written to slot `i` of a segment remains there for the segment's lifetime.
+//! This is what allows `get()` to return `&'map V` references that are valid
+//! for the entire shared-borrow lifetime without holding any guard.
+//!
+//! The invariant is scoped to `&self` access. Exclusive (`&mut self`)
+//! operations such as [`HashMap::shrink_to_fit`] may reallocate and move
+//! entries; this is sound because `&mut self` statically excludes all live
+//! `&V` references — they are bound to a `&self` borrow, which cannot coexist
+//! with `&mut self`.
+//!
 //! # Locking
 //!
-//! Writes (`insert`, `remove`, `modify`) are serialized per stripe: there are
+//! Writes (`insert`, `remove`) are serialized per stripe: there are
 //! [`NUM_STRIPES`] independent write locks, indexed by `hash % NUM_STRIPES`.
 //! Concurrent writers on different keys that fall in different stripes run in
 //! parallel; slot conflicts are resolved by CAS. A separate `growth_lock`
@@ -1599,9 +1612,11 @@ where
     /// Shrinks the map's allocated capacity to the minimum needed for the
     /// current elements, freeing all excess segments.
     ///
-    /// All entries are moved into a single fresh segment. After this call,
-    /// `capacity()` is the smallest power-of-two that can hold the current
-    /// elements at ≤ 75 % load.
+    /// All entries are **moved** into a single fresh segment — this is the one
+    /// operation that relocates values. It is sound because `&mut self`
+    /// statically prevents any `&V` reference (bound to a `&self` borrow) from
+    /// being held across this call. After it returns, `capacity()` is the
+    /// smallest power-of-two that can hold the current elements at ≤ 75 % load.
     pub fn shrink_to_fit(&mut self) {
         let entries: Vec<(K, V)> = self.drain().collect();
 
