@@ -10,6 +10,11 @@
 //! relocate entries, but the borrow checker guarantees that no `&V` reference
 //! obtained from a prior `get()` call can be held across such an operation.
 //!
+//! Removed entries are tombstoned in place rather than dropped: tombstoned
+//! slots are never reclaimed while the map is alive through `&self`, so a
+//! value is dropped only by exclusive (`&mut self`) compaction (`clear`,
+//! `retain`, `shrink_to_fit`) or when the map itself is dropped.
+//!
 //! # Quick start
 //!
 //! ```

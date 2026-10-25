@@ -25,9 +25,12 @@ one cache line of metadata, compares fingerprints in bulk, and only dereferences
 data array on a match — roughly 1-in-128 false-positive rate. Groups are visited in a
 triangular sequence that covers every group in the segment exactly once.
 
-Writes acquire one of 64 per-stripe locks (indexed by `hash % 64`), each on its own
-cache line to eliminate false sharing. Reads are fully lock-free, using Release/Acquire
-ordering on the metadata byte to synchronize with writers.
+Writes acquire one of 64 per-stripe locks (indexed by `hash % 64`). Each
+stripe is a compact 16-byte lane, with four lanes per cache line — true
+per-lane cache-line padding was benchmarked and found to *reduce* write
+throughput (it lets more writers past the stripe locks simultaneously,
+increasing metadata CAS contention). Reads are fully lock-free, using
+Release/Acquire ordering on the metadata byte to synchronize with writers.
 
 ## Quick start
 
@@ -146,19 +149,22 @@ if you know your expected peak size, pass it to `new()` to stay in one segment a
 keep utilisation near 75 %.
 
 **Fixed per-instance overhead.** Every `HashMap`, regardless of its capacity,
-allocates 64 write-lock stripes each padded to a 64-byte cache line — roughly
-4 KB of fixed overhead. This is negligible for large maps but makes `anchormap`
-a poor fit for many small, short-lived maps.
+allocates 64 write-lock stripes — roughly 1 KB of fixed overhead. This is
+negligible for large maps but makes `anchormap` a poor fit for many small,
+short-lived maps.
 
 **Removal is tombstone-based.** `remove()` marks the slot as a tombstone — the
-key and value are *not* dropped immediately. They are freed when the slot is
-claimed by a subsequent insert. If you need to reclaim segment memory after bulk removals, call
-`shrink_to_fit()` (`&mut self`) — it collects all live entries, frees all
-existing segments, allocates a single right-sized segment, and re-inserts.
+key and value are *not* dropped immediately, and the slot is never reused while
+the map is alive through shared (`&self`) access. Tombstoned data is reclaimed
+only by exclusive compaction: `clear()`, `retain()`, or `shrink_to_fit()`
+(all `&mut self`), or by dropping the map.
 
 This is intentional: `get()` returns a plain `&V` reference with no guard, so
 the value must remain in place for as long as any caller might hold that
-reference. Dropping the value eagerly would dangle those references.
+reference. Dropping or overwriting the value eagerly would dangle those
+references. The tradeoff is memory growth: a remove-heavy workload on a shared
+map accumulates tombstoned slots, so bulk removals should be paired with
+periodic exclusive compaction (`shrink_to_fit()`) to reclaim memory.
 
 
 ## When to use

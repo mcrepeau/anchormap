@@ -28,8 +28,13 @@
 //! dereference data when a fingerprint match is confirmed. The Release-Acquire
 //! pair establishes the happens-before chain for data visibility.
 //!
-//! `META_TOMBSTONE` is used by [`HashMap::remove`] for logical deletion without
-//! invalidating outstanding `&V` references from [`HashMap::get`].
+//! `META_TOMBSTONE` is used by [`HashMap::remove`] for logical deletion
+//! without invalidating outstanding `&V` references from [`HashMap::get`].
+//! Tombstoned slots are terminal under `&self`: shared-path inserts claim
+//! only `META_EMPTY` slots, so a slot's data is written at most once and
+//! never dropped or overwritten while shared references may exist. Their
+//! data is reclaimed only on exclusive (`&mut self`) paths (`clear`,
+//! `retain`, `shrink_to_fit`) or when the map is dropped.
 //!
 //! # Stability invariant
 //!
@@ -238,8 +243,11 @@ impl<K, V> Segment<K, V> {
     }
 
     /// Finds the first `META_EMPTY` or `META_TOMBSTONE` slot in the probe
-    /// sequence for `hash`. Used by `insert` after the dup check has already
-    /// been done externally via `get`.
+    /// sequence for `hash`.
+    ///
+    /// Only used on exclusive (`&mut self`) paths: tombstone reuse drops the
+    /// slot's old data, which is only sound when no shared `&V`/`&K`
+    /// references can exist.
     ///
     /// No key comparisons — scans metadata only (one byte per slot).
     fn find_available(&self, hash: u64) -> Option<usize> {
@@ -262,13 +270,18 @@ impl<K, V> Segment<K, V> {
         None
     }
 
-    /// Atomically claims the first `META_EMPTY` or `META_TOMBSTONE` slot via
-    /// CAS (`→ META_RESERVED`).
+    /// Atomically claims the first `META_EMPTY` slot via CAS
+    /// (`→ META_RESERVED`).
     ///
-    /// Returns `Some((slot_idx, old_state))` on success, `None` if the probe
-    /// sequence is exhausted. If `old_state == META_TOMBSTONE`, the caller must
-    /// drop the slot's data before writing new data.
-    fn try_claim_slot(&self, hash: u64) -> Option<(usize, u8)> {
+    /// Tombstones are deliberately **not** claimed: their data may still be
+    /// referenced by `&V`/`&K` borrows handed out under `&self`, so they can
+    /// only be reclaimed on exclusive (`&mut self`) paths. Tombstoned slots
+    /// stay unusable for shared inserts until `clear`, `retain`, or
+    /// `shrink_to_fit` compacts them.
+    ///
+    /// Returns `Some(slot_idx)` on success, `None` if the probe sequence is
+    /// exhausted.
+    fn try_claim_slot(&self, hash: u64) -> Option<usize> {
         let start = (hash as usize) & self.group_mask;
         let limit = GROUP_PROBE_LIMIT.min(self.num_groups);
 
@@ -279,7 +292,7 @@ impl<K, V> Segment<K, V> {
             for i in 0..GROUP_SIZE {
                 let slot = base + i;
                 let state = self.meta[slot].load(Ordering::Relaxed);
-                if (state == META_EMPTY || state == META_TOMBSTONE)
+                if state == META_EMPTY
                     && self
                         .meta[slot]
                         .compare_exchange(
@@ -290,7 +303,7 @@ impl<K, V> Segment<K, V> {
                         )
                         .is_ok()
                 {
-                    return Some((slot, state));
+                    return Some(slot);
                     // On CAS failure a concurrent writer claimed it; continue scanning.
                 }
             }
@@ -310,7 +323,10 @@ impl<K, V> Segment<K, V> {
     /// `META_TOMBSTONE` slots are logically absent and are skipped (not
     /// handed out as empty; insert reuses them via `find_available`).
     ///
-    /// Uses `Relaxed` ordering: safe under a stripe lock or `&mut self`.
+    /// Uses `Relaxed` ordering for the scan, with an `Acquire` re-load on
+    /// fingerprint matches before the data is dereferenced (the slot may have
+    /// been written by a writer on another stripe, so the stripe lock alone
+    /// does not order its data).
     fn probe_entry<Q>(&self, hash: u64, key: &Q) -> Result<usize, Option<usize>>
     where
         K: Borrow<Q>,
@@ -335,7 +351,13 @@ impl<K, V> Segment<K, V> {
                     }
                     META_TOMBSTONE | META_RESERVED => {} // skip
                     b if b == fp => {
-                        // SAFETY: OCCUPIED + stripe lock or &mut self ⟹ stable.
+                        // Acquire: pairs with the writer's Release fingerprint
+                        // store in write_slot before the data is touched.
+                        if self.meta[slot].load(Ordering::Acquire) != fp {
+                            continue;
+                        }
+                        // SAFETY: OCCUPIED ⟹ data published and, under &self,
+                        // never rewritten or dropped.
                         let (k, _) =
                             unsafe { (*self.data[slot].get()).assume_init_ref() };
                         if k.borrow() == key {
@@ -353,25 +375,28 @@ impl<K, V> Segment<K, V> {
     /// Combined duplicate-check and available-slot probe for insert operations.
     ///
     /// Scans the probe sequence **once** and simultaneously:
-    /// - Records the first `META_EMPTY` or `META_TOMBSTONE` slot as the write
-    ///   candidate (`first_available`).
+    /// - Records the first `META_EMPTY` slot as the write candidate
+    ///   (`first_available`). Tombstones are skipped: shared-path inserts
+    ///   never reclaim them, because outstanding `&V`/`&K` references may
+    ///   still point at their data.
     /// - Checks every fingerprint-matched OCCUPIED slot for a duplicate key.
     ///
     /// Returns `(first_available, dup_value)`:
-    /// - `first_available`: `Some((slot, old_state))` if a reusable slot was found.
+    /// - `first_available`: `Some(slot)` if an empty slot was found.
     /// - `dup_value`: `Some(&V)` if the key already exists; `None` if absent.
     ///
-    /// SAFETY: caller must hold the stripe lock for `hash % NUM_STRIPES`.
-    /// Relaxed ordering is used throughout (the lock provides the happens-before
-    /// edge for the dup check; the CAS in the caller provides it for the write).
-    fn probe_for_insert<'s>(&'s self, hash: u64, key: &K) -> (Option<(usize, u8)>, Option<&'s V>)
+    /// SAFETY: caller must hold the stripe lock for `hash % NUM_STRIPES`. The
+    /// dup-check data read is ordered by an `Acquire` re-load of the metadata
+    /// byte — the matching slot may have been written by a writer on another
+    /// stripe, so the stripe lock alone does not order its data.
+    fn probe_for_insert<'s>(&'s self, hash: u64, key: &K) -> (Option<usize>, Option<&'s V>)
     where
         K: Eq,
     {
         let fp = (hash >> 57) as u8;
         let start = (hash as usize) & self.group_mask;
         let limit = GROUP_PROBE_LIMIT.min(self.num_groups);
-        let mut first_available: Option<(usize, u8)> = None;
+        let mut first_available: Option<usize> = None;
 
         let mut probe_offset = 0;
         for j in 0..limit {
@@ -382,17 +407,18 @@ impl<K, V> Segment<K, V> {
                 match self.meta[slot].load(Ordering::Relaxed) {
                     META_EMPTY => {
                         if first_available.is_none() {
-                            first_available = Some((slot, META_EMPTY));
+                            first_available = Some(slot);
                         }
                     }
-                    META_TOMBSTONE => {
-                        if first_available.is_none() {
-                            first_available = Some((slot, META_TOMBSTONE));
-                        }
-                    }
-                    META_RESERVED => {} // transient; skip
+                    META_TOMBSTONE | META_RESERVED => {} // skip
                     b if b == fp => {
-                        // SAFETY: OCCUPIED + stripe lock ⟹ data stable.
+                        // Acquire: pairs with the writer's Release fingerprint
+                        // store in write_slot before the data is touched.
+                        if self.meta[slot].load(Ordering::Acquire) != fp {
+                            continue;
+                        }
+                        // SAFETY: OCCUPIED ⟹ data published and, under &self,
+                        // never rewritten or dropped.
                         let (k, v) = unsafe { (*self.data[slot].get()).assume_init_ref() };
                         if k == key {
                             return (first_available, Some(v));
@@ -1069,14 +1095,16 @@ where
         let _stripe = self.write_stripes[stripe_idx].lock.lock();
 
         // Single combined pass across all segments: check for a duplicate AND
-        // record the first available slot (META_EMPTY or META_TOMBSTONE).
+        // record the first empty slot. Tombstones are skipped — they are never
+        // reclaimed under `&self` (outstanding `&V` references may point at
+        // their data).
         //
         // Same key → same stripe; the stripe lock excludes all concurrent
-        // inserts/removes of this key, so Relaxed ordering is sufficient for
-        // the dup check.  This replaces the former two-pass approach
-        // (get_by_hash + try_claim_slot) with one probe sequence.
+        // inserts/removes of this key, so no duplicate can appear during this
+        // critical section. probe_for_insert Acquire-re-loads the metadata on
+        // fingerprint matches, so the dup data read is properly ordered.
         let n = self.n_segments.load(Ordering::Acquire);
-        let mut claim: Option<(*const Segment<K, V>, usize, u8)> = None;
+        let mut claim: Option<(*const Segment<K, V>, usize)> = None;
 
         for i in 0..n {
             let ptr = self.segments[i].load(Ordering::Relaxed);
@@ -1086,23 +1114,19 @@ where
                 return false; // key already present
             }
             if claim.is_none() {
-                if let Some((slot, old_state)) = available {
-                    claim = Some((ptr as *const _, slot, old_state));
+                if let Some(slot) = available {
+                    claim = Some((ptr as *const _, slot));
                 }
             }
         }
 
-        // No duplicate. Claim the identified slot via CAS.
-        if let Some((seg_ptr, slot_idx, old_state)) = claim {
+        // No duplicate. Claim the identified empty slot via CAS.
+        if let Some((seg_ptr, slot_idx)) = claim {
             let seg = unsafe { &*seg_ptr };
             if seg.meta[slot_idx]
-                .compare_exchange(old_state, META_RESERVED, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(META_EMPTY, META_RESERVED, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                if old_state == META_TOMBSTONE {
-                    // SAFETY: TOMBSTONE ⟹ data initialized; drop before overwriting.
-                    unsafe { (*seg.data[slot_idx].get()).assume_init_drop() };
-                }
                 // SAFETY: slot is now RESERVED (claimed by our CAS).
                 unsafe { seg.write_slot(slot_idx, hash, key, value) };
                 self.write_stripes[stripe_idx].count.fetch_add(1, Ordering::Relaxed);
@@ -1151,12 +1175,12 @@ where
         let stripe_idx = hash as usize % NUM_STRIPES;
         let _stripe = self.write_stripes[stripe_idx].lock.lock();
 
-        // Same single-pass combined probe as `insert`: dup check + first-available
+        // Same single-pass combined probe as `insert`: dup check + first empty
         // slot in one scan. Returns &V immediately on dup; otherwise claims and
         // writes on CAS success; falls back to insert_absent on CAS failure or
         // probe-sequence exhaustion.
         let n = self.n_segments.load(Ordering::Acquire);
-        let mut claim: Option<(*const Segment<K, V>, usize, u8)> = None;
+        let mut claim: Option<(*const Segment<K, V>, usize)> = None;
 
         for i in 0..n {
             let ptr = self.segments[i].load(Ordering::Relaxed);
@@ -1166,21 +1190,18 @@ where
                 return v;
             }
             if claim.is_none() {
-                if let Some((slot, old_state)) = available {
-                    claim = Some((ptr as *const _, slot, old_state));
+                if let Some(slot) = available {
+                    claim = Some((ptr as *const _, slot));
                 }
             }
         }
 
-        if let Some((seg_ptr, slot_idx, old_state)) = claim {
+        if let Some((seg_ptr, slot_idx)) = claim {
             let seg = unsafe { &*seg_ptr };
             if seg.meta[slot_idx]
-                .compare_exchange(old_state, META_RESERVED, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(META_EMPTY, META_RESERVED, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                if old_state == META_TOMBSTONE {
-                    unsafe { (*seg.data[slot_idx].get()).assume_init_drop() };
-                }
                 // SAFETY: slot is RESERVED; write_slot publishes with Release.
                 unsafe { seg.write_slot(slot_idx, hash, key, f()) };
                 self.write_stripes[stripe_idx].count.fetch_add(1, Ordering::Relaxed);
@@ -1205,18 +1226,13 @@ where
         let stripe_idx = hash as usize % NUM_STRIPES;
 
         // Fast path: try existing segments. Key confirmed absent so no key
-        // comparisons are needed — metadata CAS is sufficient.
+        // comparisons are needed — metadata CAS is sufficient. Only META_EMPTY
+        // slots are claimed; tombstones are never reclaimed under `&self`.
         let n = self.n_segments.load(Ordering::Acquire);
         for i in 0..n {
             let ptr = self.segments[i].load(Ordering::Relaxed);
             let seg = unsafe { &*ptr };
-            if let Some((slot_idx, old_state)) = seg.try_claim_slot(hash) {
-                if old_state == META_TOMBSTONE {
-                    // SAFETY: TOMBSTONE ⟹ data initialized; stripe lock
-                    // serializes same-stripe writers so pre-tombstone &V
-                    // references remain valid until this drop.
-                    unsafe { (*seg.data[slot_idx].get()).assume_init_drop() };
-                }
+            if let Some(slot_idx) = seg.try_claim_slot(hash) {
                 // SAFETY: slot is RESERVED (claimed by us via CAS).
                 unsafe { seg.write_slot(slot_idx, hash, key, value) };
                 self.write_stripes[stripe_idx].count.fetch_add(1, Ordering::Relaxed);
@@ -1236,10 +1252,7 @@ where
             }
             n_segs = i + 1;
             let seg = unsafe { &*ptr };
-            if let Some((slot_idx, old_state)) = seg.try_claim_slot(hash) {
-                if old_state == META_TOMBSTONE {
-                    unsafe { (*seg.data[slot_idx].get()).assume_init_drop() };
-                }
+            if let Some(slot_idx) = seg.try_claim_slot(hash) {
                 unsafe { seg.write_slot(slot_idx, hash, key, value) };
                 self.write_stripes[stripe_idx].count.fetch_add(1, Ordering::Relaxed);
                 return unsafe { &(*seg.data[slot_idx].get()).assume_init_ref().1 };
@@ -1261,7 +1274,7 @@ where
 
         let seg = unsafe { &*new_seg_ptr };
         // New segment is all META_EMPTY — try_claim_slot is guaranteed to succeed.
-        let (slot_idx, _) = seg.try_claim_slot(hash)
+        let slot_idx = seg.try_claim_slot(hash)
             .expect("fresh segment must have an empty slot");
         unsafe { seg.write_slot(slot_idx, hash, key, value) };
         self.write_stripes[stripe_idx].count.fetch_add(1, Ordering::Relaxed);
@@ -1364,8 +1377,11 @@ where
     ///
     /// Internally marks the slot as `META_TOMBSTONE` rather than freeing it
     /// immediately, so outstanding `&V` references obtained via `get()` remain
-    /// valid. The slot data is freed when it is reused by a subsequent insert
-    /// or when the map is dropped.
+    /// valid for the lifetime of the shared borrow. Tombstoned slots are
+    /// terminal under `&self`: no shared-path insert claims them, so their
+    /// data is never dropped or overwritten while the map is alive through
+    /// shared access. The slot data is reclaimed by exclusive compaction
+    /// (`clear`, `retain`, `shrink_to_fit`) or when the map is dropped.
     #[inline]
     pub fn remove<Q>(&self, key: &Q) -> bool
     where
@@ -1399,10 +1415,13 @@ where
 
         // O(1) verify: same-stripe serialization means the slot cannot be
         // concurrently modified while we hold the lock.  Check fingerprint
-        // first (cheap) then key equality.
+        // first (cheap) then key equality. The Acquire re-load pairs with the
+        // writer's Release fingerprint store — the slot may have been written
+        // by a writer on another stripe, so the stripe lock alone does not
+        // order its data.
         let seg = unsafe { &*seg_ptr };
         let meta = seg.meta[hint_slot].load(Ordering::Relaxed);
-        if meta == fp {
+        if meta == fp && seg.meta[hint_slot].load(Ordering::Acquire) == fp {
             // SAFETY: OCCUPIED + stripe lock ⟹ data is stable.
             let (k, _) = unsafe { (*seg.data[hint_slot].get()).assume_init_ref() };
             if k.borrow() == key {
@@ -1480,7 +1499,7 @@ where
         let _stripe = self.write_stripes[stripe_idx].lock.lock();
 
         let n = self.n_segments.load(Ordering::Acquire);
-        let mut claim: Option<(*const Segment<K, V>, usize, u8)> = None;
+        let mut claim: Option<(*const Segment<K, V>, usize)> = None;
 
         for i in 0..n {
             let ptr = self.segments[i].load(Ordering::Relaxed);
@@ -1490,8 +1509,8 @@ where
                 return Ok(v);
             }
             if claim.is_none() {
-                if let Some((slot, old_state)) = available {
-                    claim = Some((ptr as *const _, slot, old_state));
+                if let Some(slot) = available {
+                    claim = Some((ptr as *const _, slot));
                 }
             }
         }
@@ -1499,15 +1518,12 @@ where
         // Key is absent; call the closure. On Err, the map is left unchanged.
         let value = f()?;
 
-        if let Some((seg_ptr, slot_idx, old_state)) = claim {
+        if let Some((seg_ptr, slot_idx)) = claim {
             let seg = unsafe { &*seg_ptr };
             if seg.meta[slot_idx]
-                .compare_exchange(old_state, META_RESERVED, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(META_EMPTY, META_RESERVED, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                if old_state == META_TOMBSTONE {
-                    unsafe { (*seg.data[slot_idx].get()).assume_init_drop() };
-                }
                 unsafe { seg.write_slot(slot_idx, hash, key, value) };
                 self.write_stripes[stripe_idx].count.fetch_add(1, Ordering::Relaxed);
                 return Ok(unsafe { &(*seg.data[slot_idx].get()).assume_init_ref().1 });
@@ -2788,5 +2804,82 @@ mod tests {
         for i in 0..500u32 {
             assert_eq!(map.get(&i), Some(&i), "missing key {i} after shrink");
         }
+    }
+
+    // ── Tombstone reclamation / reference stability tests ────────────────────
+
+    #[test]
+    fn test_removed_value_not_dropped_while_ref_held() {
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct DropCounter(&'static AtomicUsize);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let map = HashMap::<u32, DropCounter>::new(64);
+        map.insert(1, DropCounter(&DROPS));
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+
+        // Reader holds a plain &V with no guard.
+        let r = map.get(&1).unwrap();
+
+        // Tombstone the slot, then churn many inserts through the same map.
+        assert!(map.remove(&1));
+        for k in 2..1000u32 {
+            map.insert(k, DropCounter(&DROPS));
+        }
+
+        // Shared-path inserts never claim tombstones, so the removed value
+        // must not have been dropped or overwritten while `r` is held.
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0, "value dropped while &V held");
+        assert_eq!(r.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_tombstone_data_reclaimed_by_exclusive_compaction() {
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct DropCounter(&'static AtomicUsize);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut map = HashMap::<u32, DropCounter>::new(64);
+        map.insert(1, DropCounter(&DROPS));
+        assert!(map.remove(&1));
+
+        // Tombstones are not reclaimed under &self.
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+
+        // Exclusive compaction reclaims the tombstoned data.
+        map.clear();
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_tombstone_data_reclaimed_by_retain() {
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct DropCounter(&'static AtomicUsize);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut map = HashMap::<u32, DropCounter>::new(64);
+        map.insert(1, DropCounter(&DROPS));
+        map.insert(2, DropCounter(&DROPS));
+        assert!(map.remove(&1));
+
+        // retain drops tombstones it encounters, and drops removed entries.
+        map.retain(|&k, _| k != 2);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 2);
+        assert!(map.is_empty());
     }
 }
