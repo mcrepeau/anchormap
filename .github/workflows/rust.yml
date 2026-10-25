@@ -17,6 +17,7 @@ jobs:
         make-default: true
     - uses: actions/checkout@v4
     - run: rustup toolchain install stable --profile minimal --no-self-update
+    - run: rustup component add clippy
     - uses: Swatinem/rust-cache@v2
       with:
         cache-on-failure: "true"
@@ -24,3 +25,29 @@ jobs:
       run: cargo build --verbose
     - name: Test
       run: cargo test --verbose
+    - name: Test (serde feature)
+      run: cargo test --verbose --features serde
+    - name: Clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+    - name: Loom exhaustive interleaving models
+      # cfg(loom) swaps the crate's atomics/mutexes for Loom's simulated
+      # implementations and enumerates every feasible interleaving of the
+      # scenarios in src/loom_tests.rs. Never enabled outside this step.
+      run: RUSTFLAGS="--cfg loom" cargo test --lib loom_tests
+
+  miri:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - run: rustup toolchain install nightly --profile minimal --no-self-update
+    - run: rustup component add miri --toolchain nightly
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: "true"
+    - name: Miri (undefined behavior and data-race detection)
+      # Runs the full test suite and doc tests under the Miri interpreter.
+      # Native Linux avoids the unsupported parking_lot foreign function
+      # calls that block Miri on the windows-msvc target.
+      run: cargo +nightly miri test
