@@ -16,8 +16,14 @@ serde = ["dep:serde"]
 
 [dependencies]
 ahash = "0.8"
-parking_lot = "0.12"
 serde = { version = "1", features = ["derive"], optional = true }
+
+# parking_lot is the production lock implementation. It is gated off under
+# cfg(miri) (parking_lot's libc futex call is rejected by recent Miri
+# nightlies; src/miri_sync.rs substitutes std::sync::Mutex) and under
+# cfg(loom) (src/loom_tests.rs models the locks with loom::sync::Mutex).
+[target.'cfg(not(any(miri, loom)))'.dependencies]
+parking_lot = "0.12"
 
 [dev-dependencies]
 criterion = "0.8.2"
