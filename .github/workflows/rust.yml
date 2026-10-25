@@ -49,5 +49,8 @@ jobs:
     - name: Miri (undefined behavior and data-race detection)
       # Runs the full test suite and doc tests under the Miri interpreter.
       # Native Linux avoids the unsupported parking_lot foreign function
-      # calls that block Miri on the windows-msvc target.
+      # calls that block Miri on the windows-msvc target; under cfg(miri)
+      # (set automatically by cargo-miri) the crate also swaps its internal
+      # locks to std::sync::Mutex, since parking_lot's libc futex call is
+      # rejected by recent Miri nightlies.
       run: cargo +nightly miri test

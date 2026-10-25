@@ -67,10 +67,12 @@ use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU8, AtomicUsize, Ordering}
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
-#[cfg(not(loom))]
+#[cfg(not(any(loom, miri)))]
 use parking_lot::Mutex;
 #[cfg(loom)]
 use loom::sync::Mutex;
+#[cfg(miri)]
+use crate::miri_sync::Mutex;
 
 use crate::hashing::{AHashHasher, TableHasher};
 
