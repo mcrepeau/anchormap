@@ -62,9 +62,15 @@ use std::cell::UnsafeCell;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
+#[cfg(not(loom))]
 use parking_lot::Mutex;
+#[cfg(loom)]
+use loom::sync::Mutex;
 
 use crate::hashing::{AHashHasher, TableHasher};
 
@@ -72,12 +78,23 @@ use crate::hashing::{AHashHasher, TableHasher};
 ///
 /// Writes for key with hash `h` acquire `write_stripes[h % NUM_STRIPES].lock`.
 /// Same-stripe writes are serialized; different-stripe writes run in parallel.
-const NUM_STRIPES: usize = 64;
+#[cfg(not(loom))]
+pub(crate) const NUM_STRIPES: usize = 64;
+/// Under `cfg(loom)` (Loom verification): a small stripe count keeps the
+/// exhaustively explored state space tractable and lets scenarios place keys
+/// in the same or different stripes deliberately.
+#[cfg(loom)]
+pub(crate) const NUM_STRIPES: usize = 2;
 
 // ── Probe-engine constants ────────────────────────────────────────────────────
 
 /// Number of slots per probe group. 16 bytes fits in one SSE2/NEON register.
+#[cfg(not(loom))]
 const GROUP_SIZE: usize = 16;
+/// Under `cfg(loom)` (Loom verification): smaller groups shrink the explored
+/// state space; the probing algorithms are unchanged.
+#[cfg(loom)]
+const GROUP_SIZE: usize = 4;
 
 /// Maximum groups probed per segment per operation.
 /// Total slots scanned per segment = 4 × 16 = 64.
@@ -446,7 +463,8 @@ impl<K, V> Segment<K, V> {
 impl<K, V> Drop for Segment<K, V> {
     fn drop(&mut self) {
         for (i, meta) in self.meta.iter_mut().enumerate() {
-            let b = *meta.get_mut();
+            // Exclusive &mut access; a Relaxed load is equivalent to get_mut.
+            let b = meta.load(Ordering::Relaxed);
             // META_EMPTY (0x80) and META_RESERVED (0xFF) never hold init data.
             // Everything else — OCCUPIED (0x00..=0x7F) and META_TOMBSTONE (0xFE)
             // — holds initialized (K, V) that must be dropped.
@@ -1997,7 +2015,7 @@ where
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::sync::Arc;

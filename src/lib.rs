@@ -31,6 +31,8 @@
 
 mod hashing;
 mod concurrent;
+#[cfg(all(loom, test))]
+mod loom_tests;
 #[cfg(feature = "serde")]
 mod serde;
 

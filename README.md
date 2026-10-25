@@ -134,6 +134,26 @@ let map = HashMap::<String, u32, StandardHasher>::with_hasher(1024, StandardHash
 
 See [BENCHMARK.md](BENCHMARK.md) for a detailed comparison.
 
+## Verification
+
+The lock-free reader guarantee is checked on two complementary layers:
+
+- `cargo test` — 75 tests including concurrent scenarios, all passing under
+  [Miri](https://github.com/rust-lang/miri).
+- [Loom](https://github.com/tokio-rs/loom) exhaustive interleaving models for
+  the claim/publish sequence, cross-stripe CAS contention, concurrent segment
+  growth and its publication chain, and remove's tombstone transition:
+
+```text
+RUSTFLAGS="--cfg loom" cargo test --lib loom_tests
+```
+
+Under `cfg(loom)` the crate's atomics and mutexes are swapped for Loom's
+simulated implementations (see `src/loom_tests.rs`), so every feasible
+interleaving of the modeled operations is enumerated and checked against
+the C++/Rust memory model. The `loom` cfg is never enabled in normal builds
+or for downstream users.
+
 ## Important considerations
 
 **Pre-size the map accurately.** `HashMap::new(n)` allocates a single segment

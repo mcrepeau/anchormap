@@ -25,6 +25,14 @@ dashmap = "6"
 papaya = "0.2"
 serde_json = "1"
 
+# Loom verification build (`RUSTFLAGS="--cfg loom" cargo test --lib loom_tests`):
+# never enabled in normal builds or for downstream users.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [[bench]]
 name = "anchormap_benchmarks"
 harness = false
