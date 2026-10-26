@@ -14,7 +14,7 @@ use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::hashing::{AHashHasher, TableHasher};
+use crate::hashing::TableHasher;
 use crate::HashMap;
 
 impl<K, V, H> Serialize for HashMap<K, V, H>
@@ -32,31 +32,33 @@ where
     }
 }
 
-impl<'de, K, V> Deserialize<'de> for HashMap<K, V, AHashHasher>
+impl<'de, K, V, H> Deserialize<'de> for HashMap<K, V, H>
 where
     K: Eq + Hash + Deserialize<'de>,
     V: Deserialize<'de>,
+    H: TableHasher + Default,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer.deserialize_map(HashMapVisitor(PhantomData))
     }
 }
 
-struct HashMapVisitor<K, V>(PhantomData<(K, V)>);
+struct HashMapVisitor<K, V, H>(PhantomData<(K, V, H)>);
 
-impl<'de, K, V> Visitor<'de> for HashMapVisitor<K, V>
+impl<'de, K, V, H> Visitor<'de> for HashMapVisitor<K, V, H>
 where
     K: Eq + Hash + Deserialize<'de>,
     V: Deserialize<'de>,
+    H: TableHasher + Default,
 {
-    type Value = HashMap<K, V, AHashHasher>;
+    type Value = HashMap<K, V, H>;
 
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("a map")
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
-        let map = HashMap::new(access.size_hint().unwrap_or(0));
+        let map = HashMap::with_hasher(access.size_hint().unwrap_or(0), H::default());
         while let Some((k, v)) = access.next_entry()? {
             let _ = map.insert(k, v);
         }
@@ -100,5 +102,22 @@ mod tests {
         let map: HashMap<String, u32> = serde_json::from_str(json).unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("key"), Some(&1));
+    }
+
+    #[test]
+    fn test_serde_roundtrip_custom_hasher() {
+        use crate::hashing::StandardHasher;
+
+        let map = HashMap::<String, u32, StandardHasher>::with_hasher(16, StandardHasher::new());
+        map.insert("alpha".to_string(), 1);
+        map.insert("beta".to_string(), 2);
+
+        let json = serde_json::to_string(&map).unwrap();
+        let restored: HashMap<String, u32, StandardHasher> =
+            serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored.get("alpha"), Some(&1));
+        assert_eq!(restored.get("beta"), Some(&2));
     }
 }

@@ -130,6 +130,31 @@ use anchormap::{HashMap, StandardHasher};
 let map = HashMap::<String, u32, StandardHasher>::with_hasher(1024, StandardHasher::new());
 ```
 
+### Concurrent value mutation
+
+There is no `&self` API that mutates an existing value in place — and there
+cannot be one. A plain `&V` from `get()` is held with no guard, so in-place
+mutation would race with readers, and replace-and-reinsert would invalidate
+the references this map exists to provide.
+
+For values that must change concurrently, put the mutability inside the
+value and update through the stable reference:
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+use anchormap::HashMap;
+
+let map = HashMap::<&str, AtomicU64>::new(64);
+map.insert("hits", AtomicU64::new(0));
+
+// &V is a plain, long-lived reference to the atomic — update from any thread.
+map.get("hits").unwrap().fetch_add(1, Ordering::Relaxed);
+```
+
+`HashMap<K, Mutex<T>>` follows the same pattern for compound updates. For
+exclusive update access, `get_mut`/`modify`/`entry` are available under
+`&mut self`.
+
 ## Performance characteristics
 
 See [BENCHMARK.md](BENCHMARK.md) for a detailed comparison.

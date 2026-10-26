@@ -6,6 +6,30 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- Iterator `size_hint` and `ExactSizeIterator`: the shared `Iter` reports
+  `(0, None)` (no bound is sound under concurrent mutation); the exclusive
+  `IterMut`, `IntoIter`, and `Drain` track exact remaining counts and
+  implement `ExactSizeIterator`.
+- `Extend<(&K, &V)>` for `K: Copy, V: Copy` (std parity).
+- `serde`: `Deserialize` for any `HashMap<K, V, H>` with
+  `H: TableHasher + Default`, not just the default hasher.
+- README section on concurrent value mutation: values that must change
+  concurrently should hold interior mutability (`AtomicU64`, `Mutex<T>`)
+  updated through the stable `&V` — an in-place mutation API is
+  fundamentally incompatible with guard-free references.
+
+### Changed
+
+- `reserve` now accounts for the ≤ 75 % target load factor (allocates
+  until raw slot capacity covers `(len + additional) * 4 / 3`), so the
+  documented "room for `additional` more elements" is actually true; the
+  doc previously conflated raw slot capacity with usable element capacity.
+- The owned `IntoIterator` impl now carries `K: Eq + Hash, H: TableHasher`
+  bounds (required for the exact size hint; unconstructible hasher types
+  were never iterable in practice).
+
+### Added (earlier in this cycle)
+
 - Randomized stress and soak tests (`tests/stress.rs`, the third
   verification leg alongside the Loom models and Miri):
   - `distinct_key_ownership`: disjoint per-thread key ranges give every

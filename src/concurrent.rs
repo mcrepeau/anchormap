@@ -523,6 +523,13 @@ impl<'a, K, V, H> Iterator for Iter<'a, K, V, H> {
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // No bound is sound on a shared snapshot: concurrent removals can
+        // reduce the yielded count below any lower bound, and concurrent
+        // inserts can raise it above any upper bound.
+        (0, None)
+    }
 }
 
 /// Exclusive mutable iterator over `(&K, &mut V)` pairs.
@@ -532,6 +539,9 @@ pub struct IterMut<'a, K, V, H = AHashHasher> {
     map: &'a mut HashMap<K, V, H>,
     seg_idx: usize,
     slot_idx: usize,
+    /// Exact number of not-yet-yielded items; exclusive access makes the
+    /// element count exact.
+    remaining: usize,
 }
 
 impl<'a, K, V, H> Iterator for IterMut<'a, K, V, H> {
@@ -560,6 +570,7 @@ impl<'a, K, V, H> Iterator for IterMut<'a, K, V, H> {
 
             // Occupied: high bit clear (fingerprint in 0x00..=0x7F).
             if seg.meta[idx].load(Ordering::Relaxed) & 0x80 == 0 {
+                self.remaining -= 1;
                 // SAFETY: OCCUPIED + exclusive &mut borrow guarantees no aliasing.
                 // Raw pointer dereference extends lifetime to 'a; sound because the
                 // segment lives for 'a and slot_idx advances (no slot yielded twice).
@@ -570,13 +581,21 @@ impl<'a, K, V, H> Iterator for IterMut<'a, K, V, H> {
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+
+impl<K, V, H> ExactSizeIterator for IterMut<'_, K, V, H> {}
 
 /// Consuming iterator over `(K, V)` pairs.
 pub struct IntoIter<K, V, H = AHashHasher> {
     map: HashMap<K, V, H>,
     seg_idx: usize,
     slot_idx: usize,
+    /// Exact number of not-yet-yielded items (owned map, no concurrency).
+    remaining: usize,
 }
 
 impl<K, V, H> Iterator for IntoIter<K, V, H> {
@@ -603,6 +622,7 @@ impl<K, V, H> Iterator for IntoIter<K, V, H> {
             self.slot_idx += 1;
 
             if seg.meta[idx].load(Ordering::Relaxed) & 0x80 == 0 {
+                self.remaining -= 1;
                 // SAFETY: OCCUPIED ⟹ data initialized; assume_init_read() moves
                 // the value out; we mark META_EMPTY so Segment::drop skips it.
                 let kv = unsafe { (*seg.data[idx].get()).assume_init_read() };
@@ -611,13 +631,22 @@ impl<K, V, H> Iterator for IntoIter<K, V, H> {
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+
+impl<K, V, H> ExactSizeIterator for IntoIter<K, V, H> {}
 
 /// Draining iterator over `(K, V)` pairs, obtained via [`HashMap::drain`].
 pub struct Drain<'a, K, V, H = AHashHasher> {
     map: &'a mut HashMap<K, V, H>,
     seg_idx: usize,
     slot_idx: usize,
+    /// Exact number of not-yet-yielded items; exclusive access makes the
+    /// element count exact.
+    remaining: usize,
 }
 
 impl<'a, K, V, H> Iterator for Drain<'a, K, V, H> {
@@ -644,6 +673,7 @@ impl<'a, K, V, H> Iterator for Drain<'a, K, V, H> {
             self.slot_idx += 1;
 
             if seg.meta[idx].load(Ordering::Relaxed) & 0x80 == 0 {
+                self.remaining -= 1;
                 // SAFETY: OCCUPIED ⟹ initialized; assume_init_read() moves the
                 // pair out, then we mark META_EMPTY so Segment::drop skips it.
                 let kv = unsafe { (*seg.data[idx].get()).assume_init_read() };
@@ -652,7 +682,13 @@ impl<'a, K, V, H> Iterator for Drain<'a, K, V, H> {
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+
+impl<K, V, H> ExactSizeIterator for Drain<'_, K, V, H> {}
 
 impl<'a, K, V, H> Drop for Drain<'a, K, V, H> {
     fn drop(&mut self) {
@@ -1469,15 +1505,21 @@ where
         false
     }
 
-    /// Reserves capacity for at least `additional` more elements without growing
-    /// during subsequent inserts.
+    /// Reserves capacity for at least `additional` more elements so that
+    /// subsequent inserts avoid growth (at the target ≤ 75 % load factor).
     ///
-    /// After this call, `capacity() >= len() + additional`. One or more new
-    /// segments may be allocated (each double the size of the previous one).
+    /// Note that [`capacity`](Self::capacity) counts raw slots; the usable
+    /// element capacity is roughly `capacity() * 3 / 4`. This call allocates
+    /// one or more new segments (each double the size of the previous one)
+    /// until the raw capacity covers `(len() + additional) * 4 / 3` slots.
+    /// Extreme hash clustering can still trigger growth earlier.
     ///
     /// Available on `&self`; can be called concurrently with reads and writes.
     pub fn reserve(&self, additional: usize) {
-        let needed = self.len().saturating_add(additional);
+        // Slots needed to hold len + additional elements at ≤ 75 % load.
+        // capacity() counts raw slots, of which only ~3/4 are usable before
+        // probe regions saturate and growth is triggered.
+        let needed = self.len().saturating_add(additional).saturating_mul(4) / 3;
         if self.total_capacity.load(Ordering::Relaxed) >= needed {
             return;
         }
@@ -1637,7 +1679,9 @@ where
 
     /// Returns a mutable iterator over all `(&K, &mut V)` pairs.
     pub fn iter_mut(&mut self) -> IterMut<'_, K, V, H> {
-        IterMut { map: self, seg_idx: 0, slot_idx: 0 }
+        // Exact under &mut self: no concurrent mutation.
+        let remaining = self.len();
+        IterMut { map: self, seg_idx: 0, slot_idx: 0, remaining }
     }
 
     /// Returns a mutable iterator over all values.
@@ -1752,7 +1796,9 @@ where
     /// The map is left empty when the iterator is dropped, even if not fully
     /// consumed.
     pub fn drain(&mut self) -> Drain<'_, K, V, H> {
-        Drain { map: self, seg_idx: 0, slot_idx: 0 }
+        // Exact under &mut self: no concurrent mutation.
+        let remaining = self.len();
+        Drain { map: self, seg_idx: 0, slot_idx: 0, remaining }
     }
 
     /// Gets the entry for `key` for in-place manipulation.
@@ -1978,6 +2024,20 @@ where
     }
 }
 
+impl<'a, K, V, H> Extend<(&'a K, &'a V)> for HashMap<K, V, H>
+where
+    K: Eq + Hash + Copy,
+    V: Copy,
+    H: TableHasher,
+{
+    /// On duplicate keys the existing value is kept (first-wins).
+    fn extend<I: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: I) {
+        for (k, v) in iter {
+            let _ = self.insert(*k, *v);
+        }
+    }
+}
+
 // ── IntoIterator impls ────────────────────────────────────────────────────────
 
 impl<'a, K, V, H> IntoIterator for &'a HashMap<K, V, H>
@@ -1993,12 +2053,18 @@ where
     }
 }
 
-impl<K, V, H> IntoIterator for HashMap<K, V, H> {
+impl<K, V, H> IntoIterator for HashMap<K, V, H>
+where
+    K: Eq + Hash,
+    H: TableHasher,
+{
     type Item = (K, V);
     type IntoIter = IntoIter<K, V, H>;
 
     fn into_iter(self) -> IntoIter<K, V, H> {
-        IntoIter { map: self, seg_idx: 0, slot_idx: 0 }
+        // Exact on the owned map: no concurrent mutation.
+        let remaining = self.len();
+        IntoIter { map: self, seg_idx: 0, slot_idx: 0, remaining }
     }
 }
 
@@ -2901,5 +2967,66 @@ mod tests {
         map.retain(|&k, _| k != 2);
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
         assert!(map.is_empty());
+    }
+
+    // ── Iterator size_hint / Extend parity ─────────────────────────────────────
+
+    #[test]
+    fn test_iterator_size_hints() {
+        let mut map = HashMap::<u32, u32>::new(64);
+        for i in 0..10u32 {
+            map.insert(i, i);
+        }
+
+        // Shared snapshot: no sound bounds under concurrent mutation.
+        {
+            let mut it = map.iter();
+            assert_eq!(it.size_hint(), (0, None));
+            it.next();
+            assert_eq!(it.size_hint(), (0, None));
+        }
+
+        // Exclusive iterators: exact counts.
+        {
+            let mut it = map.iter_mut();
+            assert_eq!(it.size_hint(), (10, Some(10)));
+            assert_eq!(it.len(), 10);
+            it.next();
+            assert_eq!(it.size_hint(), (9, Some(9)));
+        }
+
+        {
+            let mut drain = map.drain();
+            assert_eq!(drain.size_hint(), (10, Some(10)));
+            drain.next();
+            assert_eq!(drain.size_hint(), (9, Some(9)));
+        } // Drain::drop exhausts the rest; map is now empty
+        assert!(map.is_empty());
+
+        for i in 0..10u32 {
+            map.insert(i, i);
+        }
+        let mut into = map.into_iter();
+        assert_eq!(into.size_hint(), (10, Some(10)));
+        into.next();
+        assert_eq!(into.size_hint(), (9, Some(9)));
+        assert_eq!(into.count(), 9);
+    }
+
+    #[test]
+    fn test_extend_from_references() {
+        let src = HashMap::<u32, u32>::new(64);
+        src.insert(2, 20);
+        src.insert(3, 30);
+
+        let mut map = HashMap::<u32, u32>::new(64);
+        map.insert(1, 10);
+        map.insert(2, 99); // existing key: first-wins on extend
+        map.extend(src.iter());
+
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&1), Some(&10));
+        assert_eq!(map.get(&2), Some(&99));
+        assert_eq!(map.get(&3), Some(&30));
     }
 }
