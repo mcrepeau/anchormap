@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [0.3.1] - 2026-10-25
 
 ### Added
 
@@ -28,10 +28,10 @@ All notable changes to this project are documented in this file.
   bounds (required for the exact size hint; unconstructible hasher types
   were never iterable in practice).
 
-### Added (earlier in this cycle)
+### Verification (not part of the published crate)
 
 - Randomized stress and soak tests (`tests/stress.rs`, the third
-  verification leg alongside the Loom models and Miri):
+  verification leg alongside the Loom models and Miri), run in CI:
   - `distinct_key_ownership`: disjoint per-thread key ranges give every
     operation a deterministic oracle; exercises concurrent growth and
     heavy cross-stripe write traffic.
