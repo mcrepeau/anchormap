@@ -34,6 +34,10 @@ jobs:
       # implementations and enumerates every feasible interleaving of the
       # scenarios in src/loom_tests.rs. Never enabled outside this step.
       run: RUSTFLAGS="--cfg loom" cargo test --lib loom_tests
+    - name: Stress soak
+      # Randomized soak with per-op oracles, per-key linearizability
+      # checking, and held-reference stability; see tests/stress.rs.
+      run: cargo test --test stress -- --ignored
 
   miri:
 

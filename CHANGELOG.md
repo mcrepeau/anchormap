@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Randomized stress and soak tests (`tests/stress.rs`, the third
+  verification leg alongside the Loom models and Miri):
+  - `distinct_key_ownership`: disjoint per-thread key ranges give every
+    operation a deterministic oracle; exercises concurrent growth and
+    heavy cross-stripe write traffic.
+  - `shared_key_linearizability`: random get/insert/remove on a shared
+    key space from many threads; each result is recorded with a
+    real-time interval and every key's history is checked for
+    linearizability against a sequential model by backtracking search
+    (Wing–Gong style).
+  - `held_reference_stability`: readers hold `&V` across unrelated
+    concurrent churn (including removal of the referenced key) and
+    verify the value never changes — the anchored-slot invariant under
+    load.
+  - `long_soak` (ignored by default): the heavy variant, run in CI.
+
 ## [0.3.0] - 2026-10-25
 
 ### Security / soundness fixes
