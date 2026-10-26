@@ -24,7 +24,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 # nightlies; src/miri_sync.rs substitutes std::sync::Mutex) and under
 # cfg(loom) (src/loom_tests.rs models the locks with loom::sync::Mutex).
 [target.'cfg(not(any(miri, loom)))'.dependencies]
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 [dev-dependencies]
 criterion = "0.8.2"
