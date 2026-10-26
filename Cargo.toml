@@ -1,7 +1,8 @@
 [package]
 name = "anchormap"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
+rust-version = "1.87"
 license = "MIT"
 description = "Lock-free concurrent hash map: elements never move after insertion, enabling lock-free reads"
 repository = "https://github.com/mcrepeau/anchormap"

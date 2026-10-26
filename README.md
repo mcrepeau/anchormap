@@ -38,10 +38,10 @@ Release/Acquire ordering on the metadata byte to synchronize with writers.
 
 ```toml
 [dependencies]
-anchormap = "0.2"
+anchormap = "0.3"
 
 # Enable serde Serialize / Deserialize:
-# anchormap = { version = "0.1", features = ["serde"] }
+# anchormap = { version = "0.3", features = ["serde"] }
 ```
 
 ### Usage
